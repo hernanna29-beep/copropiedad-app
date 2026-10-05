@@ -1,0 +1,3 @@
+class PruebaPantalla {
+  const PruebaPantalla();
+}

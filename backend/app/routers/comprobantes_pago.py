@@ -1,0 +1,323 @@
+﻿from pathlib import Path
+from uuid import uuid4
+
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    UploadFile,
+    status,
+)
+from fastapi.responses import FileResponse
+from sqlalchemy.orm import Session
+
+from app.core.database import get_db
+from app.core.dependencies import obtener_usuario_actual
+from app.models.comprobante_pago import ComprobantePago
+from app.schemas.comprobante_pago import (
+    ComprobantePagoActualizar,
+    ComprobantePagoResponse,
+)
+from app.services.comprobante_pago_service import (
+    actualizar_estado_comprobante,
+    crear_comprobante,
+    listar_comprobantes_en_revision,
+    listar_comprobantes_por_pago,
+)
+from app.services.pago_service import obtener_pago_del_propietario
+
+
+router = APIRouter(
+    prefix="/comprobantes",
+    tags=["Comprobantes de Pago"],
+)
+
+
+UPLOAD_DIR = Path("uploads/comprobantes")
+
+UPLOAD_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+
+TIPOS_PERMITIDOS = {
+    "application/pdf": ".pdf",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+}
+
+
+MAX_FILE_SIZE = 5 * 1024 * 1024
+
+
+@router.post(
+    "/{pago_id}",
+    response_model=ComprobantePagoResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def subir_comprobante(
+    pago_id: int,
+    archivo: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    usuario_actual=Depends(obtener_usuario_actual),
+):
+    """
+    Permite a un RESIDENTE subir el comprobante
+    de pago asociado a uno de sus pagos.
+    """
+
+    if usuario_actual["rol"] != "RESIDENTE":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Solo los residentes pueden subir comprobantes",
+        )
+
+    propietario_id = usuario_actual["propietario_id"]
+
+    if propietario_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="El usuario no tiene un propietario asociado",
+        )
+
+    pago = obtener_pago_del_propietario(
+        db=db,
+        pago_id=pago_id,
+        propietario_id=propietario_id,
+    )
+
+    if pago is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pago no encontrado o no pertenece al propietario",
+        )
+
+    # Un pago que ya fue confirmado como PAGADO
+    # no debe recibir nuevos comprobantes.
+    if pago.estado == "PAGADO":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="El pago ya se encuentra pagado",
+        )
+
+    if archivo.content_type not in TIPOS_PERMITIDOS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Tipo de archivo no permitido. "
+                "Solo se permiten PDF, JPG y PNG"
+            ),
+        )
+
+    contenido = await archivo.read()
+
+    if len(contenido) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="El archivo no puede superar los 5 MB",
+        )
+
+    extension = TIPOS_PERMITIDOS[archivo.content_type]
+
+    nombre_original = archivo.filename or "comprobante"
+
+    nombre_archivo = f"{uuid4().hex}{extension}"
+
+    ruta_archivo = UPLOAD_DIR / nombre_archivo
+
+    ruta_archivo.write_bytes(contenido)
+
+    try:
+        comprobante = crear_comprobante(
+            db=db,
+            pago_id=pago_id,
+            nombre_archivo=nombre_original,
+            ruta_archivo=str(ruta_archivo),
+            tipo_archivo=archivo.content_type,
+            tamano_archivo=len(contenido),
+        )
+
+        return comprobante
+
+    except Exception:
+        if ruta_archivo.exists():
+            ruta_archivo.unlink()
+
+        raise
+
+
+@router.get(
+    "/pago/{pago_id}",
+    response_model=list[ComprobantePagoResponse],
+)
+def listar_comprobantes_pago(
+    pago_id: int,
+    db: Session = Depends(get_db),
+    usuario_actual=Depends(obtener_usuario_actual),
+):
+    """
+    Lista los comprobantes asociados a un pago
+    perteneciente al propietario autenticado.
+    """
+
+    if usuario_actual["rol"] != "RESIDENTE":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Solo los residentes pueden consultar sus comprobantes",
+        )
+
+    propietario_id = usuario_actual["propietario_id"]
+
+    if propietario_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="El usuario no tiene un propietario asociado",
+        )
+
+    pago = obtener_pago_del_propietario(
+        db=db,
+        pago_id=pago_id,
+        propietario_id=propietario_id,
+    )
+
+    if pago is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pago no encontrado o no pertenece al propietario",
+        )
+
+    return listar_comprobantes_por_pago(
+        db=db,
+        pago_id=pago_id,
+    )
+
+
+@router.get(
+    "/admin/en-revision",
+    response_model=list[ComprobantePagoResponse],
+)
+def listar_comprobantes_admin(
+    db: Session = Depends(get_db),
+    usuario_actual=Depends(obtener_usuario_actual),
+):
+    """
+    Lista los comprobantes que están pendientes
+    de revisión por parte del administrador.
+    """
+
+    if usuario_actual["rol"] != "ADMIN":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Solo los administradores pueden consultar esta información",
+        )
+
+    return listar_comprobantes_en_revision(
+        db=db,
+    )
+
+
+@router.put(
+    "/admin/{comprobante_id}",
+    response_model=ComprobantePagoResponse,
+)
+def actualizar_comprobante_admin(
+    comprobante_id: int,
+    datos: ComprobantePagoActualizar,
+    db: Session = Depends(get_db),
+    usuario_actual=Depends(obtener_usuario_actual),
+):
+    """
+    Permite al administrador aprobar o rechazar
+    un comprobante de pago.
+    """
+
+    if usuario_actual["rol"] != "ADMIN":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Solo los administradores pueden procesar comprobantes",
+        )
+
+    try:
+        comprobante = actualizar_estado_comprobante(
+            db=db,
+            comprobante_id=comprobante_id,
+            estado=datos.estado,
+            observaciones=datos.observaciones,
+        )
+
+    except ValueError as error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(error),
+        ) from error
+
+    if comprobante is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Comprobante no encontrado",
+        )
+
+    return comprobante
+
+
+@router.get(
+    "/admin/{comprobante_id}/archivo",
+)
+def descargar_comprobante_admin(
+    comprobante_id: int,
+    db: Session = Depends(get_db),
+    usuario_actual=Depends(obtener_usuario_actual),
+):
+    """
+    Permite al administrador descargar o visualizar
+    el archivo del comprobante.
+    """
+
+    if usuario_actual["rol"] != "ADMIN":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Solo los administradores pueden descargar comprobantes",
+        )
+
+    comprobante = db.get(
+        ComprobantePago,
+        comprobante_id,
+    )
+
+    if comprobante is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Comprobante no encontrado",
+        )
+
+    ruta_archivo = Path(
+        comprobante.ruta_archivo
+    ).resolve()
+
+    directorio_base = Path(
+        UPLOAD_DIR
+    ).resolve()
+
+    try:
+        ruta_archivo.relative_to(
+            directorio_base
+        )
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Ruta de archivo no válida",
+        )
+
+    if not ruta_archivo.is_file():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="El archivo del comprobante no existe",
+        )
+
+    return FileResponse(
+        path=str(ruta_archivo),
+        media_type=comprobante.tipo_archivo,
+        filename=comprobante.nombre_archivo,
+    )
